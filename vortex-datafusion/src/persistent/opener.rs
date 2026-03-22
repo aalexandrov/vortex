@@ -432,6 +432,12 @@ fn apply_byte_range(
 }
 
 fn byte_range_to_row_range(byte_range: Range<u64>, row_count: u64, total_size: u64) -> Range<u64> {
+    // Datafusion might generate ranges for files with no rows. In such cases,
+    // we return an empty range.
+    if row_count == 0 {
+        return 0..0;
+    }
+
     let average_row = total_size / row_count;
     assert!(average_row > 0, "A row must always have at least one byte");
 
@@ -497,6 +503,9 @@ mod tests {
     #[case(50..105, 100, 105, 50..100)]
     #[case(0..1, 4, 8, 0..0)]
     #[case(1..8, 4, 8, 0..4)]
+    #[case(0..100, 0, 100, 0..0)]
+    #[case(10..50, 0, 0, 0..0)]
+    #[case(0..1, 0, 1, 0..0)]
     fn test_range_translation(
         #[case] byte_range: Range<u64>,
         #[case] row_count: u64,
