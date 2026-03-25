@@ -200,6 +200,13 @@ impl FileOpener for VortexOpener {
                 .await
                 .map_err(|e| exec_datafusion_err!("Failed to open Vortex file {e}"))?;
 
+            if vxf.row_count() == 0 {
+                // There are no rows in this file: we can save ourselves some
+                // work and return an empty stream immediately.
+                let empty_stream = stream::iter(vec![]).boxed();
+                return Ok(empty_stream);
+            }
+
             // This is the expected arrow types of the actual columns in the file, which might have different types
             // from the unified logical schema or miss
             let this_file_schema = Arc::new(calculate_physical_schema(
@@ -432,11 +439,7 @@ fn apply_byte_range(
 }
 
 fn byte_range_to_row_range(byte_range: Range<u64>, row_count: u64, total_size: u64) -> Range<u64> {
-    // Datafusion might generate ranges for files with no rows. In such cases,
-    // we return an empty range.
-    if row_count == 0 {
-        return 0..0;
-    }
+    debug_assert!(row_count > 0); // Asserted by an early exit check in VortexOpener::open
 
     let average_row = total_size / row_count;
     assert!(average_row > 0, "A row must always have at least one byte");
@@ -503,9 +506,6 @@ mod tests {
     #[case(50..105, 100, 105, 50..100)]
     #[case(0..1, 4, 8, 0..0)]
     #[case(1..8, 4, 8, 0..4)]
-    #[case(0..100, 0, 100, 0..0)]
-    #[case(10..50, 0, 0, 0..0)]
-    #[case(0..1, 0, 1, 0..0)]
     fn test_range_translation(
         #[case] byte_range: Range<u64>,
         #[case] row_count: u64,
@@ -626,6 +626,33 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_open_empty_file() -> anyhow::Result<()> {
+        use futures::TryStreamExt;
+
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let data_batch = record_batch!(("a", Int32, Vec::<i32>::new())).unwrap();
+        let file_path = "part=1/empty.vortex";
+        let file_size =
+            write_arrow_to_vortex(object_store.clone(), file_path, data_batch.clone()).await?;
+
+        let file_schema = data_batch.schema();
+        // Parallel scans may attach a byte range even for empty files; the
+        // opener must not call byte_range_to_row_range when the row_count is 0.
+        let file =
+            PartitionedFile::new_with_range(file_path.to_string(), file_size, 0, file_size as i64);
+
+        let table_schema = TableSchema::from_file_schema(file_schema.clone());
+
+        let opener = make_opener(object_store, table_schema, None);
+        let stream = opener.open(file)?.await?;
+        let data = stream.try_collect::<Vec<_>>().await?;
+
+        assert_eq!(data.len(), 0);
 
         Ok(())
     }
